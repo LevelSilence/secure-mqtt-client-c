@@ -241,7 +241,7 @@ Client *client_create(const char *id)
     c->perma_key = 0;
     c->reconnect_attempts = 0;
 
-    c->mosq = mosquitto_new(id, true, NULL);
+    c->mosq = mosquitto_new(id, true, c);
     if (!c->mosq)
     {
         LOG_ERROR("mosquitto_new failed");
@@ -333,6 +333,182 @@ ClientError client_connect(Client *c, const char *host, int port)
     return CLIENT_OK;
 }
 
+int find_channel_key(Client *c, const char *topic)
+{
+    for (int i = 0; i < c->channel_key_count; i++)
+    {
+        if (strcmp(c->channel_keys[i].topic, topic) == 0)
+            return i;
+    }
+    return -1;
+}
+
+
+
+ClientError client_subscribe(
+    Client *c,
+    const char *topic,
+    int qos
+)
+{
+    if (!c || !c->connected)
+    {
+        LOG_ERROR("Subscribe failed: client not connected");
+        return CLIENT_ERROR_CONNECT;
+    }
+
+    /* Store topic in subscribed_channels table */
+    if (c->channel_key_count < 20)
+    {
+        strncpy(
+            c->channel_keys[c->channel_key_count].topic,
+            topic,
+            sizeof(c->channel_keys[c->channel_key_count].topic) - 1
+        );
+        c->channel_keys[c->channel_key_count].key = 0; // key arrives later
+        c->channel_key_count++;
+    }
+    else
+    {
+        LOG_WARN("Subscribed channel table full");
+    }
+
+    /* Actual MQTT SUBSCRIBE */
+    int rc = mosquitto_subscribe(//rc stores the result of the subscription like 
+
+        c->mosq,
+        NULL,
+        topic,
+        qos
+    );
+
+    if (rc != MOSQ_ERR_SUCCESS)
+    {
+        LOG_ERROR("mosquitto_subscribe failed: %s", mosquitto_strerror(rc));
+        return CLIENT_ERROR_MQTT;
+    }
+
+    LOG_INFO("Subscribed to topic '%s' (qos=%d)", topic, qos);
+    return CLIENT_OK;
+}
+
+//client side api for unsubscribe
+ClientError client_unsubscribe(Client *c, const char *topic)
+{
+    if (!c || !c->connected)
+    {
+        LOG_ERROR("Unsubscribe failed: client not connected");
+        return CLIENT_ERROR_CONNECT;
+    }
+
+    /* 1. Remove topic from local channel_keys table */
+    for (int i = 0; i < c->channel_key_count; i++)
+    {
+        if (strcmp(c->channel_keys[i].topic, topic) == 0)
+        {
+            /* shift remaining entries left */
+            for (int j = i; j < c->channel_key_count - 1; j++)
+            {
+                c->channel_keys[j] = c->channel_keys[j + 1];
+            }
+            c->channel_key_count--;
+            break;
+        }
+    }
+
+    /* 2. Send UNSUBSCRIBE to broker */
+    int rc = mosquitto_unsubscribe(c->mosq, NULL, topic);
+    if (rc != MOSQ_ERR_SUCCESS)
+    {
+        LOG_ERROR("Unsubscribe failed for '%s': %s",
+                  topic, mosquitto_strerror(rc));
+        return CLIENT_ERROR_MQTT;
+    }
+
+    LOG_INFO("Unsubscribed from topic '%s'", topic);
+    return CLIENT_OK;
+}
+
+
+
+ClientError client_publish(
+    Client *c,
+    const char *topic,
+    const unsigned char *payload,
+    size_t payload_len,
+    int qos,
+    bool retain
+)
+{
+    /* 1. Must be connected */
+    if (!c || !c->connected)
+    {
+        LOG_ERROR("Publish failed: client not connected");
+        return CLIENT_ERROR_CONNECT;
+    }
+
+    /* 2. KEYDIS is NEVER encrypted */
+    if (strcmp(topic, "KEYDIS") == 0)
+    {
+        mosquitto_publish(
+            c->mosq,
+            NULL,
+            topic,
+            payload_len,
+            payload,
+            qos,
+            retain
+        );
+        return CLIENT_OK;
+    }
+
+    /* 3. Wait for channel key (max 5 tries) */
+    int attempts = 0;
+    int key_index = -1;
+
+    while ((key_index = find_channel_key(c, topic)) == -1 ||
+       c->channel_keys[key_index].key == 0)
+    {
+        if (attempts++ >= 5)
+        {
+            LOG_ERROR("Channel key not received for topic '%s'", topic);
+            return CLIENT_ERROR_TIMEOUT;
+        }
+
+        LOG_DEBUG("Waiting for channel key for topic '%s'...", topic);
+        sleep(1);
+    }
+
+    /* 4. Encrypt payload */
+    unsigned char encrypted[2048];
+    memset(encrypted, 0, sizeof(encrypted));
+
+    size_t encrypted_len = 0;
+
+    encrypt_data(
+        c->channel_keys[key_index].key,
+        payload,
+        payload_len,
+        encrypted,
+        &encrypted_len
+    );
+    
+    mosquitto_publish(
+        c->mosq,
+        NULL,
+        topic,
+        encrypted_len,
+        encrypted,
+        qos,
+        retain
+    );
+    
+
+    LOG_INFO("Encrypted publish on topic '%s'", topic);
+    return CLIENT_OK;
+}
+
+
 // ASCON decryption function
 int decrypt_message(
     unsigned long key_value,
@@ -403,7 +579,13 @@ int decrypt_key(
 }
 
 // encrypt data
-int encrypt_data(unsigned long key_value, const unsigned char *plaintext, size_t plaintext_len, unsigned char *ciphertext)
+int encrypt_data(
+    unsigned long key_value,
+    const unsigned char *plaintext,
+    size_t plaintext_len,
+    unsigned char *ciphertext,
+    size_t *cipher_len_out)
+
 {
     unsigned char key[16];
     unsigned char nonce[16];
@@ -429,7 +611,24 @@ int encrypt_data(unsigned long key_value, const unsigned char *plaintext, size_t
         plaintext_len,
         ciphertext);
 
+    *cipher_len_out = plaintext_len + 16;
+
     return 0;
+}
+
+void set_channel_key(Client *c, const char *topic, unsigned long key)
+{
+    int idx = find_channel_key(c, topic);
+    if (idx >= 0) {
+        c->channel_keys[idx].key = key;
+        return;
+    }
+
+    if (c->channel_key_count < 20) {
+        strcpy(c->channel_keys[c->channel_key_count].topic, topic);
+        c->channel_keys[c->channel_key_count].key = key;
+        c->channel_key_count++;
+    }
 }
 
 void on_message(
@@ -437,96 +636,142 @@ void on_message(
     void *userdata,
     const struct mosquitto_message *msg)
 {
-    Client *client = (Client *)userdata;
+    Client *c = (Client *)userdata;
 
-    /* Step 1: only process KEYDIS if waiting */
-    if (!client->waiting_for_key)
-        return;
-
-    /* Step 2: check topic */
-    if (strcmp(msg->topic, "KEYDIS") != 0)
-        return;
-
-    /* Step 3: copy payload to string */
     char payload[1024];
-    memset(payload, 0, sizeof(payload));
     size_t len = msg->payloadlen < sizeof(payload) - 1
                      ? msg->payloadlen
                      : sizeof(payload) - 1;
     memcpy(payload, msg->payload, len);
     payload[len] = '\0';
 
-    /* Step 4: split by || */
-    char *parts[5];
+    char *parts[32] = {0};
     int count = 0;
-
-    char *parts[5] = {0};
-    int count = 0;
-
     char *p = payload;
-    while (count < 5)
-    {
-        char *next = strstr(p, "||");
-        if (!next)
-            break;
-        *next = '\0';
+
+    if (strncmp(p, "||", 2) == 0)
+        p += 2;
+
+    while (count < 32) {
+        char *sep = strstr(p, "||");
+        if (!sep) break;
+        *sep = '\0';
         parts[count++] = p;
-        p = next + 2;
+        p = sep + 2;
     }
 
-    /* Step 5: basic validation */
-    if (count < 4)
-        return;
+    if (count < 2) return;
 
-    /* parts[1] should be "2" */
-    if (strcmp(parts[1], "2") != 0)
-        return;
+    const char *topic = msg->topic;
 
-    /* parts[2] should be my client_id */
-    if (strcmp(parts[2], client->client_id) != 0)
-        return;
+    //for keydis raw message
+        if (strcmp(topic, "KEYDIS") == 0)
+        {
+            if (count >= 3 && strcmp(parts[0], "2") == 0)
+            {
+                const char *client_id = parts[1];
+                const char *hex_cipher = parts[2];
+    
+                if (strcmp(client_id, c->client_id) == 0)
+                {
+                    unsigned char cipher_bytes[512];
+                    unsigned char decrypted[512];
+    
+                    int cipher_len = hex_to_bytes(hex_cipher, cipher_bytes, sizeof(cipher_bytes));
+                    if (cipher_len <= 0)
+                    {
+                        LOG_ERROR("Invalid hex cipher");
+                        return;
+                    }
+    
+                    int decrypted_len = RSA_private_decrypt(
+                        cipher_len,
+                        cipher_bytes,
+                        decrypted,
+                        c->private_key,
+                        RSA_PKCS1_PADDING
+                    );
+    
+                    if (decrypted_len <= 0)
+                    {
+                        LOG_ERROR("RSA decryption failed");
+                        return;
+                    }
+    
+                    decrypted[decrypted_len] = '\0';
+    
+                    c->perma_key = strtoul((char*)decrypted, NULL, 10);
+                    c->waiting_for_key = false;
+                    
+                    mosquitto_unsubscribe(c->mosq, NULL, "KEYDIS");
+                    LOG_INFO("Unsubscribed from KEYDIS after handshake");
 
-    /* If we reach here → valid KEYDIS response */
-    LOG_INFO("Valid KEYDIS response received for client %s", client->client_id);
+                    LOG_INFO("Perma key received successfully");
+                }
+            }
+            return;
+        }
+    
+        if (c->perma_key == 0)
+        {
+            LOG_WARN("Perma key not established yet");
+            return;
+        }
 
-    unsigned char encrypted_key[256];
-    int encrypted_len = hex_to_bytes(
-        parts[3],
-        encrypted_key,
-        sizeof(encrypted_key));
 
-    if (encrypted_len < 0)
+//rekey messae handling
+    if (strcmp(topic, "KEYDIS") != 0 && count >= 4)
     {
-        LOG_ERROR("Invalid encrypted key hex");
+        /*
+           Expected format:
+           ||channel||client1||xor1||client2||xor2||
+        */
+
+        const char *channel = parts[0];
+
+        for (int i = 1; i + 1 < count; i += 2)
+        {
+            const char *client_id = parts[i];
+            unsigned long xor_val = strtoul(parts[i + 1], NULL, 10);
+
+            if (strcmp(client_id, c->client_id) == 0)
+            {
+                unsigned long channel_key = xor_val ^ c->perma_key;
+                set_channel_key(c, channel, channel_key);
+
+                LOG_INFO("Rekeyed channel '%s'", channel);
+                return;
+            }
+        }
         return;
     }
 
-    // RSA decryption
-    unsigned char decrypted[256];
-    int decrypted_len = RSA_private_decrypt(
-        encrypted_len,
-        encrypted_key,
-        decrypted,
-        client->private_key,
-        RSA_PKCS1_PADDING);
-
-    if (decrypted_len <= 0)
+//for encrypted message
+    if (strcmp(topic, "KEYDIS") != 0)
     {
-        LOG_ERROR("RSA decryption failed");
+        int idx = find_channel_key(c, topic);
+        if (idx < 0) {
+            LOG_WARN("No channel key for topic '%s'", topic);
+            return;
+        }
+
+        unsigned char decrypted[1024];
+        memset(decrypted, 0, sizeof(decrypted));
+
+        decrypt_message(
+            c->channel_keys[idx].key,
+            msg->payload,
+            msg->payloadlen,
+            decrypted
+        );
+
+        LOG_INFO("Decrypted message on '%s': %s", topic, decrypted);
         return;
     }
 
-    /* make it a string */
-    decrypted[decrypted_len] = '\0';
 
-    client->perma_key = strtoul((char *)decrypted, NULL, 10);
-
-    LOG_INFO("Permanent key received and stored");
-
-    // reset waiting flag and unsubscribe
-    client->waiting_for_key = false;
-    mosquitto_unsubscribe(mosq, NULL, "KEYDIS");
 }
+
 
 int hex_to_bytes(const char *hex, unsigned char *out, size_t max_len)
 {
@@ -573,6 +818,8 @@ ClientError client_disconnect(Client *c)
     c->waiting_for_key = false;
     c->no_more_connections = true;
 
+     
+
     LOG_INFO("Client disconnected cleanly");
     return CLIENT_OK;
 }
@@ -614,3 +861,7 @@ void on_disconnect(
 //         sleep(2);  // same as asyncio.sleep(2)
 //     }
 // }
+
+
+
+
