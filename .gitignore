@@ -1,15 +1,14 @@
-*.o
-*.out
-*.exe
-build/
-.vscode/
-.idea/
 # Build outputs
-src/client
-src/client2
+*.o
 *.so
+*.exe
+client
+client2
+build/
 
-# Mosquitto build
-src/mosquitto/build/
-src/mosquitto/CMakeFiles/
-src/mosquitto/Makefile
+# External dependencies
+ascon/
+src/mosquitto/
+
+# OS junk
+.DS_Store
