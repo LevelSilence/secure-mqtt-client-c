@@ -1,24 +1,55 @@
-//works only on linux   
+//works on crossplatform(linux+windows)
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <windows.h>
+    #pragma comment(lib, "ws2_32.lib")
+    #define sleep(x) Sleep((x) * 1000)
+#else
+    #include <unistd.h>
+#endif
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
-#include <unistd.h>
 #include <time.h>
-#include <fcntl.h>
 
-// replacement for entire AMQTT adapters stack
-#include <sys/socket.h>
-#include <arpa/inet.h>
-
-#include <mosquitto.h> // MQTT library replacement for entire AMQTT stack
+#include <mosquitto.h>
 
 #include <openssl/rsa.h>
 #include <openssl/pem.h>
 #include <openssl/bn.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include "api.h"// ASCON encryption/decryption
+#include <openssl/rand.h>
+
+
+
+#include "api.h"
+int crypto_aead_encrypt(
+    unsigned char *c,
+    unsigned long long *clen,
+    const unsigned char *m,
+    unsigned long long mlen,
+    const unsigned char *ad,
+    unsigned long long adlen,
+    const unsigned char *nsec,
+    const unsigned char *npub,
+    const unsigned char *k
+);
+
+int crypto_aead_decrypt(
+    unsigned char *m,
+    unsigned long long *mlen,
+    unsigned char *nsec,
+    const unsigned char *c,
+    unsigned long long clen,
+    const unsigned char *ad,
+    unsigned long long adlen,
+    const unsigned char *npub,
+    const unsigned char *k
+);
 
 // replacement for logging macros
 // c doesnt have loggers,log levels,modules etc.
@@ -141,6 +172,9 @@ void on_disconnect(
     void *userdata,
     int reason_code);
 
+void client_destroy(Client *c);
+int hex_to_bytes(const char *hex, unsigned char *out, size_t max_len);
+
 // function to generate RSA keypair for the client
 ClientError client_generate_rsa_keys(Client *c)
 {
@@ -210,7 +244,7 @@ ClientError client_generate_rsa_keys(Client *c)
 // for dynamic allocation and initialization of Client structure
 Client *client_create(const char *id)
 {
-    Client *c = calloc(1, sizeof(Client));
+    Client *c = calloc(1,sizeof(Client));
     if (!c)
     {
         LOG_ERROR("Memory allocation failed");
@@ -477,27 +511,52 @@ ClientError client_publish(
         sleep(1);
     }
 
-    /* 4. Encrypt payload */
+    // /* 4. Encrypt payload */
+    // unsigned char encrypted[2048];
+    // memset(encrypted, 0, sizeof(encrypted));
+
+    // size_t encrypted_len = 0;
+
+    // encrypt_data(
+    //     c->channel_keys[key_index].key,
+    //     payload,
+    //     payload_len,
+    //     encrypted,
+    //     &encrypted_len
+    // );
+    
+    // mosquitto_publish(
+    //     c->mosq,
+    //     NULL,
+    //     topic,
+    //     encrypted_len,
+    //     encrypted,
+    //     qos,
+    //     retain
+    // );
+    
     unsigned char encrypted[CRYPTO_NPUBBYTES + 2048 + CRYPTO_ABYTES];
     unsigned long long ciphertext_len;
-
+    
     unsigned char key[CRYPTO_KEYBYTES];
     unsigned char nonce[CRYPTO_NPUBBYTES];
-
+    
     memset(key, 0, CRYPTO_KEYBYTES);
-
-    memcpy(key, &c->channel_keys[key_index].key,
-        sizeof(unsigned long) < CRYPTO_KEYBYTES ?
-        sizeof(unsigned long) : CRYPTO_KEYBYTES);
-
-    /* secure random nonce */
+    
+    /* derive key from channel key */
+    memcpy(key,
+           &c->channel_keys[key_index].key,
+           sizeof(unsigned long) < CRYPTO_KEYBYTES ?
+           sizeof(unsigned long) : CRYPTO_KEYBYTES);
+    
+    /* generate RANDOM nonce */
     if (RAND_bytes(nonce, CRYPTO_NPUBBYTES) != 1)
     {
-        LOG_ERROR("RAND_bytes failed");
+        LOG_ERROR("RAND_bytes failed for nonce");
         return CLIENT_ERROR_GENERIC;
     }
-
-    /* encrypt after nonce space */
+    
+    /* encrypt AFTER nonce space */
     crypto_aead_encrypt(
         encrypted + CRYPTO_NPUBBYTES,
         &ciphertext_len,
@@ -508,10 +567,10 @@ ClientError client_publish(
         nonce,
         key
     );
-
-    /* prepend nonce */
+    
+    /* copy nonce at beginning */
     memcpy(encrypted, nonce, CRYPTO_NPUBBYTES);
-
+    
     /* publish nonce + ciphertext */
     mosquitto_publish(
         c->mosq,
@@ -522,11 +581,10 @@ ClientError client_publish(
         qos,
         retain
     );
-    
-
     LOG_INFO("Encrypted publish on topic '%s'", topic);
     return CLIENT_OK;
 }
+
 
 // // ASCON decryption function
 // int decrypt_message(
@@ -649,98 +707,18 @@ void set_channel_key(Client *c, const char *topic, unsigned long key)
         c->channel_key_count++;
     }
 }
+
 void on_message(
     struct mosquitto *mosq,
     void *userdata,
     const struct mosquitto_message *msg)
 {
     Client *c = (Client *)userdata;
-    const char *topic = msg->topic;
-
-    /* =========================
-       HANDLE KEYDIS (Handshake)
-       ========================= */
-    if (strcmp(topic, "KEYDIS") == 0)
-    {
-        char payload[1024];
-        size_t len = msg->payloadlen < sizeof(payload) - 1
-                        ? msg->payloadlen
-                        : sizeof(payload) - 1;
-
-        memcpy(payload, msg->payload, len);
-        payload[len] = '\0';
-
-        char *parts[32] = {0};
-        int count = 0;
-        char *p = payload;
-
-        if (strncmp(p, "||", 2) == 0)
-            p += 2;
-
-        while (count < 32)
-        {
-            char *sep = strstr(p, "||");
-            if (!sep) break;
-            *sep = '\0';
-            parts[count++] = p;
-            p = sep + 2;
-        }
-
-        /* Handshake response: ||2||client_id||encrypted_key|| */
-        if (count >= 3 && strcmp(parts[0], "2") == 0)
-        {
-            const char *client_id = parts[1];
-            const char *hex_cipher = parts[2];
-
-            if (strcmp(client_id, c->client_id) == 0)
-            {
-                unsigned char cipher_bytes[512];
-                unsigned char decrypted[512];
-
-                int cipher_len = hex_to_bytes(hex_cipher, cipher_bytes, sizeof(cipher_bytes));
-                if (cipher_len <= 0)
-                {
-                    LOG_ERROR("Invalid hex cipher");
-                    return;
-                }
-
-                int decrypted_len = RSA_private_decrypt(
-                    cipher_len,
-                    cipher_bytes,
-                    decrypted,
-                    c->private_key,
-                    RSA_PKCS1_PADDING
-                );
-
-                if (decrypted_len <= 0)
-                {
-                    LOG_ERROR("RSA decryption failed");
-                    return;
-                }
-
-                decrypted[decrypted_len] = '\0';
-
-                c->perma_key = strtoul((char*)decrypted, NULL, 10);
-                c->waiting_for_key = false;
-
-                mosquitto_unsubscribe(c->mosq, NULL, "KEYDIS");
-
-                LOG_INFO("Perma key received successfully");
-            }
-        }
-
-        return;
-    }
-    
-    /* =========================
-    Rekey Message Handling
-    ========================= */
 
     char payload[1024];
     size_t len = msg->payloadlen < sizeof(payload) - 1
-                    ? msg->payloadlen
-                    : sizeof(payload) - 1;
-
+                     ? msg->payloadlen
+                     : sizeof(payload) - 1;
     memcpy(payload, msg->payload, len);
     payload[len] = '\0';
 
@@ -759,80 +737,127 @@ void on_message(
         p = sep + 2;
     }
 
-    /*
-    Expected format:
-    ||channel||client1||xor1||client2||xor2||
-    */
-/* Control messages always start with || */
-if (payload[0] == '|' && payload[1] == '|') {
+    if (count < 2) return;
 
-    if (count >= 4) {
+    const char *topic = msg->topic;
+
+    //for keydis raw message
+        if (strcmp(topic, "KEYDIS") == 0)
+        {
+            if (count >= 3 && strcmp(parts[0], "2") == 0)
+            {
+                const char *client_id = parts[1];
+                const char *hex_cipher = parts[2];
+    
+                if (strcmp(client_id, c->client_id) == 0)
+                {
+                    unsigned char cipher_bytes[512];
+                    unsigned char decrypted[512];
+    
+                    int cipher_len = hex_to_bytes(hex_cipher, cipher_bytes, sizeof(cipher_bytes));
+                    if (cipher_len <= 0)
+                    {
+                        LOG_ERROR("Invalid hex cipher");
+                        return;
+                    }
+    
+                    int decrypted_len = RSA_private_decrypt(
+                        cipher_len,
+                        cipher_bytes,
+                        decrypted,
+                        c->private_key,
+                        RSA_PKCS1_PADDING
+                    );
+    
+                    if (decrypted_len <= 0)
+                    {
+                        LOG_ERROR("RSA decryption failed");
+                        return;
+                    }
+    
+                    decrypted[decrypted_len] = '\0';
+    
+                    c->perma_key = strtoul((char*)decrypted, NULL, 10);
+                    c->waiting_for_key = false;
+                    
+                    mosquitto_unsubscribe(c->mosq, NULL, "KEYDIS");
+                    LOG_INFO("Unsubscribed from KEYDIS after handshake");
+
+                    LOG_INFO("Perma key received successfully");
+                }
+            }
+            return;
+        }
+    
+        if (c->perma_key == 0)
+        {
+            LOG_WARN("Perma key not established yet");
+            return;
+        }
+
+
+//rekey messae handling
+    if (strcmp(topic, "KEYDIS") != 0 && count >= 4)
+    {
+        /*
+           Expected format:
+           ||channel||client1||xor1||client2||xor2||
+        */
 
         const char *channel = parts[0];
 
-        for (int i = 1; i + 1 < count; i += 2) {
-
+        for (int i = 1; i + 1 < count; i += 2)
+        {
             const char *client_id = parts[i];
             unsigned long xor_val = strtoul(parts[i + 1], NULL, 10);
 
-            if (strcmp(client_id, c->client_id) == 0) {
-
+            if (strcmp(client_id, c->client_id) == 0)
+            {
                 unsigned long channel_key = xor_val ^ c->perma_key;
                 set_channel_key(c, channel, channel_key);
 
                 LOG_INFO("Rekeyed channel '%s'", channel);
-                return;  // IMPORTANT
+                return;
             }
         }
-    }
-
-    return;  // ← DO NOT FALL THROUGH
-}
-
-encrypted_handler:
-    /* =========================
-       Encrypted Message Handler
-       ========================= */
-
-    if (c->perma_key == 0)
-    {
-        LOG_WARN("Perma key not established yet");
         return;
     }
 
+//for encrypted message
+if (strcmp(topic, "KEYDIS") != 0)
+{
     int idx = find_channel_key(c, topic);
-    if (idx < 0)
-    {
+    if (idx < 0) {
         LOG_WARN("No channel key for topic '%s'", topic);
         return;
     }
-
+    unsigned char decrypted[2048];
+    unsigned long long decrypted_len;
+    
+    unsigned char key[CRYPTO_KEYBYTES];
+    memset(key, 0, CRYPTO_KEYBYTES);
+    
+    memcpy(key,
+           &c->channel_keys[idx].key,
+           sizeof(unsigned long) < CRYPTO_KEYBYTES ?
+           sizeof(unsigned long) : CRYPTO_KEYBYTES);
+    
+    /* payload must contain nonce + ciphertext */
     if (msg->payloadlen < CRYPTO_NPUBBYTES)
     {
         LOG_ERROR("Payload too short");
         return;
     }
-
-    unsigned char decrypted[2048];
-    unsigned long long decrypted_len;
-    memset(decrypted, 0, sizeof(decrypted));
-
-    unsigned char key[CRYPTO_KEYBYTES];
-    memset(key, 0, CRYPTO_KEYBYTES);
-
-    memcpy(key,
-           &c->channel_keys[idx].key,
-           sizeof(unsigned long) < CRYPTO_KEYBYTES ?
-           sizeof(unsigned long) : CRYPTO_KEYBYTES);
-
-    /* Extract nonce */
+    
+    /* extract nonce */
     unsigned char nonce[CRYPTO_NPUBBYTES];
     memcpy(nonce, msg->payload, CRYPTO_NPUBBYTES);
-
-    /* Ciphertext */
+    
+    /* ciphertext starts after nonce */
     const unsigned char *ciphertext = msg->payload + CRYPTO_NPUBBYTES;
     size_t ciphertext_len = msg->payloadlen - CRYPTO_NPUBBYTES;
-
+    
+    /* decrypt */
     if (crypto_aead_decrypt(
             decrypted,
             &decrypted_len,
@@ -846,11 +871,18 @@ encrypted_handler:
         LOG_ERROR("ASCON decryption failed");
         return;
     }
-
+    
     decrypted[decrypted_len] = '\0';
+    
+    LOG_INFO("Decrypted message on '%s': %s", topic, decrypted);    
 
-    LOG_INFO("Decrypted message on '%s': %s", topic, decrypted);
+    
+    return;
 }
+
+
+}
+
 
 int hex_to_bytes(const char *hex, unsigned char *out, size_t max_len)
 {
@@ -943,11 +975,21 @@ void on_disconnect(
 
 
 
-
 int main()
 {
+#ifdef _WIN32
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+    {
+        printf("WSAStartup failed\n");
+        return 1;
+    }
+#endif
+
+    /* Initialize mosquitto library */
     mosquitto_lib_init();
 
+    /* Create client */
     Client *client = client_create("client1");
     if (!client)
     {
@@ -955,36 +997,30 @@ int main()
         return 1;
     }
 
-    if (client_connect(client, "localhost", 1884) != CLIENT_OK)
+    /* Connect to broker */
+    if (client_connect(client, "localhost", 1883) != CLIENT_OK)
     {
         printf("Connection failed\n");
         return 1;
     }
 
     printf("Client running...\n");
-    client_subscribe(client, "testtopic", 1);
 
-/* Wait until channel key is set */
-while (find_channel_key(client, "testtopic") == -1 ||
-       client->channel_keys[find_channel_key(client, "testtopic")].key == 0)
-{
-    sleep(1);
-}
-
-client_publish(client,
-               "testtopic",
-               (unsigned char*)"hello secure world",
-               strlen("hello secure world"),
-               1,
-               false);	
+    /* Keep program alive */
     while (1)
     {
         sleep(1);
     }
 
+    /* Cleanup (never reached in infinite loop, but correct practice) */
     client_disconnect(client);
     client_destroy(client);
     mosquitto_lib_cleanup();
 
+#ifdef _WIN32
+    WSACleanup();
+#endif
+
     return 0;
 }
+

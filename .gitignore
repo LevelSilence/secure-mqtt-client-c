@@ -4,3 +4,12 @@
 build/
 .vscode/
 .idea/
+# Build outputs
+src/client
+src/client2
+*.so
+
+# Mosquitto build
+src/mosquitto/build/
+src/mosquitto/CMakeFiles/
+src/mosquitto/Makefile
